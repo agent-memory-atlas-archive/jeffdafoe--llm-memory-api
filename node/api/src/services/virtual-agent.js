@@ -2987,13 +2987,24 @@ async function handleDirectChat(virtualAgentName, fromAgent, messageText, messag
             providerCallOpts.tools = toolsOffered;
             providerCallOpts.messages = toolUseMessages;
         }
-        const providerResult = await retryWithBackoff(agent.agent, () =>
-            withActivityIndicator(agent.agent, () => providerFn(systemPrompt, userMessage, providerCallOpts)),
-            async (err, retryInfo) => {
-                await chatSend(virtualAgentName, [fromAgent], null,
-                    `[Retrying] Initial attempt failed: ${err.message}. Retrying ${retryInfo.retriesRemaining} more time(s) over the next ~${formatDuration(retryInfo.totalSeconds)}.`, { sceneId, conversationId, isError: true });
-            }
-        );
+        const callProvider = () =>
+            withActivityIndicator(agent.agent, () => providerFn(systemPrompt, userMessage, providerCallOpts));
+        // No server-side retry for a salem-engine wait=true tick: the engine
+        // abandons it after its 90s HTTP timeout and its reactor re-ticks, so a
+        // retry (first one at 5 minutes on the live cadence) would bill a call
+        // nobody reads and persist an undispatched tool_call into the NPC's
+        // history. This does not cover a FIRST call that itself outruns the 90s
+        // (no abort is propagated to the provider) — rare enough (1 in ~15k calls
+        // over 7 days, 2026-09) not to warrant cancellation plumbing.
+        const simWaitTick = isSimChat && opts && opts.ackReplyOnInsert;
+        const providerResult = simWaitTick
+            ? await callProvider()
+            : await retryWithBackoff(agent.agent, callProvider,
+                async (err, retryInfo) => {
+                    await chatSend(virtualAgentName, [fromAgent], null,
+                        `[Retrying] Initial attempt failed: ${err.message}. Retrying ${retryInfo.retriesRemaining} more time(s) over the next ~${formatDuration(retryInfo.totalSeconds)}.`, { sceneId, conversationId, isError: true });
+                }
+            );
         const response = providerResult.text || '';
         const usage = providerResult.usage;
         const replyToolCalls = Array.isArray(providerResult.tool_calls) ? providerResult.tool_calls : [];
