@@ -23,6 +23,8 @@ const { requireByName, resolveByName, resolveById, checkNameAvailability, modera
 const { hasAccess, requireAccess, getReadableNamespaces, validateNamespace, clearCache: clearPermissionsCache } = require('../services/namespace-permissions');
 const { SESSION_KIND } = require('../constants');
 const { getVisibleActorIds, canSee, clearCache: clearVisibilityCache } = require('../services/actor-visibility');
+const { createAttemptLimiter, acquireAttempt } = require('../services/attempt-limiter');
+const { linkAccount } = require('../services/account-link');
 const { hasPermission, requirePerm, getPermissionMap, clearCache: clearAdminPermissionsCache } = require('../services/admin-permissions');
 const notePerms = require('../services/note-permissions');
 const { apiRoute } = require('../middleware/route-wrapper');
@@ -189,6 +191,70 @@ router.post('/admin/logout', async (req, res) => {
         console.error('Admin logout error:', err.message);
         res.status(500).json({
             error: { code: 'INTERNAL', message: 'Logout failed' }
+        });
+    }
+});
+
+// Password-attempt throttles for /admin/link-account (LLM-670). Keyed per
+// caller AND per target: the caller key stops one session hammering, the
+// target key stops an attacker spreading guesses across many signups.
+const linkCallerLimiter = createAttemptLimiter({ maxAttempts: 5, windowMs: 15 * 60 * 1000 });
+const linkTargetLimiter = createAttemptLimiter({ maxAttempts: 10, windowMs: 15 * 60 * 1000 });
+
+// POST /admin/link-account — link the logged-in user's account with another
+// account they control, so the two can see each other (LLM-670).
+// Body: { username, password } — the OTHER account's dashboard login.
+//
+// The decision logic and its reasoning live in services/account-link.js;
+// this route only wires in the real database, hashing, cache and limiter.
+router.post('/admin/link-account', async (req, res) => {
+    try {
+        const result = await linkAccount({
+            callerId: req.authenticatedUser.id,
+            username: sanitize.agentName(req.body.username),
+            password: req.body.password,
+        }, {
+            acquireAttempt: (callerId, username) =>
+                acquireAttempt([[linkCallerLimiter, callerId], [linkTargetLimiter, username]]),
+            findTarget: async (username) => {
+                const found = await pool.query(
+                    'SELECT id, name, password_hash, password_salt FROM actors WHERE name = $1 AND password_hash IS NOT NULL',
+                    [username]
+                );
+                return found.rows[0] || null;
+            },
+            verifyPassword: verify,
+            dummyHash: (password) => hashToken(password, DUMMY_SALT),
+            sharesRealm: async (a, b) => {
+                const overlap = await pool.query(
+                    'SELECT 1 FROM actors a1 JOIN actors a2 ON a1.realms && a2.realms WHERE a1.id = $1 AND a2.id = $2',
+                    [a, b]
+                );
+                return overlap.rows.length > 0;
+            },
+            // One statement, so both halves land or neither does. UNIQUE
+            // (actor_id, target_actor_id) makes an existing half a no-op.
+            // Explicit rows only; an existing wildcard row is not touched.
+            insertLinkRows: async (a, b) => {
+                const inserted = await pool.query(
+                    `INSERT INTO actor_visibility_configuration (actor_id, target_actor_id)
+                     VALUES ($1, $2), ($2, $1)
+                     ON CONFLICT (actor_id, target_actor_id) DO NOTHING`,
+                    [a, b]
+                );
+                return inserted.rowCount;
+            },
+            clearVisibilityCache,
+            log: logAdmin,
+        });
+        if (result.headers) {
+            res.set(result.headers);
+        }
+        res.status(result.status).json(result.body);
+    } catch (err) {
+        console.error('Admin link-account error:', err.message);
+        res.status(500).json({
+            error: { code: 'INTERNAL', message: 'Failed to link account' }
         });
     }
 });
